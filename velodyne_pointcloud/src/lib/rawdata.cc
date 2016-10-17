@@ -44,7 +44,7 @@ namespace velodyne_rawdata
 
   RawData::RawData() {}
   
-  /** Uppdate parameters: conversions and update */
+  /** Update parameters: conversions and update */
   void RawData::setParameters(double min_range,
                               double max_range,
                               double view_direction,
@@ -95,7 +95,7 @@ namespace velodyne_rawdata
       return -1;
     }
     
-    ROS_INFO_STREAM("Data will be processed as a VLP-16...num_lasers: " << calibration_.num_lasers);
+    ROS_INFO_STREAM("Number of lasers: " << calibration_.num_lasers << ".");
     
     // Set up cached values for sin and cos of all the possible headings
     for (uint16_t rot_index = 0; rot_index < ROTATION_MAX_UNITS; ++rot_index) {
@@ -179,7 +179,11 @@ namespace velodyne_rawdata
           float vert_offset = corrections.vert_offset_correction;
   
           // Compute the distance in the xy plane (w/o accounting for rotation)
-          float xy_distance = distance * cos_vert_angle;
+          /**the new term of 'vert_offset * sin_vert_angle'
+           * was added to the expression due to the mathemathical
+           * model we used.
+           */
+          float xy_distance = distance * cos_vert_angle - vert_offset * sin_vert_angle;
   
           // Calculate temporal X, use absolute value.
           float xx = xy_distance * sin_rot_angle - horiz_offset * cos_rot_angle;
@@ -207,16 +211,29 @@ namespace velodyne_rawdata
           }
   
           float distance_x = distance + distance_corr_x;
-          xy_distance = distance_x * cos_vert_angle;
-          x = xy_distance * sin_rot_angle + horiz_offset * cos_rot_angle;
+          /**the new term of 'vert_offset * sin_vert_angle'
+           * was added to the expression due to the mathemathical
+           * model we used.
+           */
+          xy_distance = distance_x * cos_vert_angle - vert_offset * sin_vert_angle ;
+          ///the expression wiht '-' is proved to be better than the one with '+'
+          x = xy_distance * sin_rot_angle - horiz_offset * cos_rot_angle;
   
           float distance_y = distance + distance_corr_y;
-          xy_distance = distance_y * cos_vert_angle;
+          xy_distance = distance_y * cos_vert_angle - vert_offset * sin_vert_angle ;
+          /**the new term of 'vert_offset * sin_vert_angle'
+           * was added to the expression due to the mathemathical
+           * model we used.
+           */
           y = xy_distance * cos_rot_angle + horiz_offset * sin_rot_angle;
   
           // Using distance_y is not symmetric, but the velodyne manual
           // does this.
-          z = distance_y * sin_vert_angle + vert_offset;
+          /**the new term of 'vert_offset * cos_vert_angle'
+           * was added to the expression due to the mathemathical
+           * model we used.
+           */
+          z = distance_y * sin_vert_angle + vert_offset*cos_vert_angle;
   
           /** Use standard ROS coordinate system (right-hand rule) */
           float x_coord = y;
@@ -247,7 +264,7 @@ namespace velodyne_rawdata
             point.x = x_coord;
             point.y = y_coord;
             point.z = z_coord;
-            point.intensity = (uint8_t) intensity;
+            point.intensity = intensity;
   
             // append this point to the cloud
             pc.points.push_back(point);
@@ -268,17 +285,27 @@ namespace velodyne_rawdata
   {
     float azimuth;
     float azimuth_diff;
-    float last_azimuth_diff;
+    float last_azimuth_diff=0;
     float azimuth_corrected_f;
     int azimuth_corrected;
     float x, y, z;
     float intensity;
-    uint8_t dsr;
-    
+
     const raw_packet_t *raw = (const raw_packet_t *) &pkt.data[0];
 
     for (int block = 0; block < BLOCKS_PER_PACKET; block++) {
-      assert(0xEEFF == raw->blocks[block].header);
+
+      // ignore packets with mangled or otherwise different contents
+      if (UPPER_BANK != raw->blocks[block].header) {
+        // Do not flood the log with messages, only issue at most one
+        // of these warnings per minute.
+        ROS_WARN_STREAM_THROTTLE(60, "skipping invalid VLP-16 packet: block "
+                                 << block << " header value is "
+                                 << raw->blocks[block].header);
+        return;                         // bad packet: skip the rest
+      }
+
+      // Calculate difference between current and next block's azimuth angle.
       azimuth = (float)(raw->blocks[block].rotation);
       if (block < (BLOCKS_PER_PACKET-1)){
         azimuth_diff = (float)((36000 + raw->blocks[block+1].rotation - raw->blocks[block].rotation)%36000);
@@ -299,7 +326,7 @@ namespace velodyne_rawdata
           
           /** correct for the laser rotation as a function of timing during the firings **/
           azimuth_corrected_f = azimuth + (azimuth_diff * ((dsr*VLP16_DSR_TOFFSET) + (firing*VLP16_FIRING_TOFFSET)) / VLP16_BLOCK_TDURATION);
-          azimuth_corrected = (int)round(fmod(azimuth_corrected_f,36000.0));
+          azimuth_corrected = ((int)round(azimuth_corrected_f)) % 36000;
           
           /*condition added to avoid calculating points which are not
             in the interesting defined area (min_angle < area < max_angle)*/
@@ -309,6 +336,8 @@ namespace velodyne_rawdata
                ||(config_.min_angle > config_.max_angle 
                && (azimuth_corrected <= config_.max_angle 
                || azimuth_corrected >= config_.min_angle))){
+
+            // convert polar coordinates to Euclidean XYZ
             float distance = tmp.uint * DISTANCE_RESOLUTION;
             distance += corrections.dist_correction;
             
@@ -330,7 +359,11 @@ namespace velodyne_rawdata
             float vert_offset = corrections.vert_offset_correction;
     
             // Compute the distance in the xy plane (w/o accounting for rotation)
-            float xy_distance = distance * cos_vert_angle;
+            /**the new term of 'vert_offset * sin_vert_angle'
+             * was added to the expression due to the mathemathical
+             * model we used.
+             */
+            float xy_distance = distance * cos_vert_angle - vert_offset * sin_vert_angle;
     
             // Calculate temporal X, use absolute value.
             float xx = xy_distance * sin_rot_angle - horiz_offset * cos_rot_angle;
@@ -358,16 +391,28 @@ namespace velodyne_rawdata
             }
     
             float distance_x = distance + distance_corr_x;
-            xy_distance = distance_x * cos_vert_angle;
-            x = xy_distance * sin_rot_angle + horiz_offset * cos_rot_angle;
+            /**the new term of 'vert_offset * sin_vert_angle'
+             * was added to the expression due to the mathemathical
+             * model we used.
+             */
+            xy_distance = distance_x * cos_vert_angle - vert_offset * sin_vert_angle ;
+            x = xy_distance * sin_rot_angle - horiz_offset * cos_rot_angle;
     
             float distance_y = distance + distance_corr_y;
-            xy_distance = distance_y * cos_vert_angle;
+            /**the new term of 'vert_offset * sin_vert_angle'
+             * was added to the expression due to the mathemathical
+             * model we used.
+             */
+            xy_distance = distance_y * cos_vert_angle - vert_offset * sin_vert_angle ;
             y = xy_distance * cos_rot_angle + horiz_offset * sin_rot_angle;
     
             // Using distance_y is not symmetric, but the velodyne manual
             // does this.
-            z = distance_y * sin_vert_angle + vert_offset;
+            /**the new term of 'vert_offset * cos_vert_angle'
+             * was added to the expression due to the mathemathical
+             * model we used.
+             */
+            z = distance_y * sin_vert_angle + vert_offset*cos_vert_angle;
   
     
             /** Use standard ROS coordinate system (right-hand rule) */
@@ -376,7 +421,6 @@ namespace velodyne_rawdata
             float z_coord = z;
     
             /** Intensity Calculation */
-    
             float min_intensity = corrections.min_intensity;
             float max_intensity = corrections.max_intensity;
     
@@ -393,15 +437,14 @@ namespace velodyne_rawdata
     
             if (pointInRange(distance)) {
     
-              // convert polar coordinates to Euclidean XYZ
+              // append this point to the cloud
               VPoint point;
               point.ring = corrections.laser_ring;
               point.x = x_coord;
               point.y = y_coord;
               point.z = z_coord;
-              point.intensity = (uint8_t) intensity;
-    
-              // append this point to the cloud
+              point.intensity = intensity;
+
               pc.points.push_back(point);
               ++pc.width;
             }
