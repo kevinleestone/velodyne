@@ -33,8 +33,42 @@
 #include <sys/file.h>
 #include <velodyne_driver/input.h>
 
+
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+#include <errno.h>
+#include <time.h>
+#include <getopt.h>
+
+#include <netdb.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+
+#include <linux/net_tstamp.h>
+#include <linux/sockios.h>
+
+
+#define TRY(x)                                                          \
+  do {                                                                  \
+    int __rc = (x);                                                     \
+      if( __rc < 0 ) {                                                  \
+        fprintf(stderr, "ERROR: TRY(%s) failed\n", #x);                 \
+        fprintf(stderr, "ERROR: at %s:%d\n", __FILE__, __LINE__);       \
+        fprintf(stderr, "ERROR: rc=%d errno=%d (%s)\n",                 \
+                __rc, errno, strerror(errno));                          \
+        exit(1);                                                        \
+      }                                                                 \
+  } while( 0 )
+
+
 namespace velodyne_driver
 {
+
   static const size_t packet_size =
     sizeof(velodyne_msgs::VelodynePacket().data);
 
@@ -103,6 +137,16 @@ namespace velodyne_driver
       }
 
     ROS_DEBUG("Velodyne socket fd is %d\n", sockfd_);
+
+    int enable = 1;
+
+    // **************************************************************************
+    // New timestamping
+    ROS_DEBUG("Selecting hardware timestamping mode.");
+    enable = SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE
+              | SOF_TIMESTAMPING_SYS_HARDWARE | SOF_TIMESTAMPING_SOFTWARE;
+    TRY(setsockopt(sockfd_, SOL_SOCKET, SO_TIMESTAMPING, &enable, sizeof(int)));
+    
   }
 
   /** @brief destructor */
@@ -124,6 +168,24 @@ namespace velodyne_driver
     sockaddr_in sender_address;
     socklen_t sender_address_len = sizeof(sender_address);
 
+    // **************************************************************************
+    // New timestamping
+    struct msghdr msg;
+    struct iovec iov;
+    char control[1024];
+  
+    bzero(&sender_address, sizeof(struct sockaddr_in));
+  
+    iov.iov_base = &pkt->data[0];
+    iov.iov_len = packet_size;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_name = &sender_address;
+    msg.msg_namelen = sizeof(struct sockaddr_in);
+    msg.msg_control = control;
+    msg.msg_controllen = 1024;
+  
+    
     while (true)
       {
         // Unfortunately, the Linux kernel recvfrom() implementation
@@ -169,10 +231,11 @@ namespace velodyne_driver
 
         // Receive packets that should now be available from the
         // socket using a blocking read.
-        ssize_t nbytes = recvfrom(sockfd_, &pkt->data[0],
-                                  packet_size,  0,
-                                  (sockaddr*) &sender_address,
-                                  &sender_address_len);
+        //ssize_t nbytes = recvfrom(sockfd_, &pkt->data[0],
+        //                          packet_size,  0,
+        //                          (sockaddr*) &sender_address,
+        //                          &sender_address_len);
+        ssize_t nbytes = recvmsg(sockfd_, &msg, 0);
 
         if (nbytes < 0)
           {
@@ -199,12 +262,51 @@ namespace velodyne_driver
                          << nbytes << " bytes");
       }
 
-    // Average the times at which we begin and end reading.  Use that to
-    // estimate when the scan occurred. Add the time offset.
-    double time2 = ros::Time::now().toSec();
-    pkt->stamp = ros::Time((time2 + time1) / 2.0 + time_offset);
+    pkt->stamp = handleTime(&msg);
 
     return 0;
+  }
+
+  // Extract timestamp from packet metadata fallback to using system time.
+  ros::Time InputSocket::handleTime(struct msghdr* msg)
+  {
+    struct timespec* ts = NULL;
+    struct cmsghdr* cmsg;
+    ros::Time stamp;
+  
+    for( cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg,cmsg) ) {
+      if( cmsg->cmsg_level != SOL_SOCKET )
+        continue;
+  
+      switch( cmsg->cmsg_type ) {
+      case SO_TIMESTAMPNS:
+        ts = (struct timespec*) CMSG_DATA(cmsg);
+        break;
+      case SO_TIMESTAMPING:
+        ts = (struct timespec*) CMSG_DATA(cmsg);
+        break;
+      default:
+        /* Ignore other cmsg options */
+        break;
+      }
+    }
+
+    if( ts != NULL ) {
+      // Use first of three timestamps, system time based
+      stamp = ros::Time(ts[0].tv_sec, ts[0].tv_nsec);
+
+      ROS_INFO_ONCE("Using packet metadata to get time (best)");
+    } else {
+      // Timestamp not available from linux socket.
+      //stamp = ros::Time::now();
+
+      // FIXME: remove this before checking in
+      stamp = ros::Time(); 
+
+      ROS_WARN_ONCE("Using syscall to get time (nominal)");
+    }
+
+    return stamp;
   }
 
   ////////////////////////////////////////////////////////////////////////
@@ -323,5 +425,6 @@ namespace velodyne_driver
         empty_ = true;              // maybe the file disappeared?
       } // loop back and try again
   }
+
 
 } // velodyne namespace

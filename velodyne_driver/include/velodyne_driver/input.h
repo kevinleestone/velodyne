@@ -80,7 +80,9 @@ namespace velodyne_driver
     virtual int getPacket(velodyne_msgs::VelodynePacket *pkt, 
                           const double time_offset);
     void setDeviceIP( const std::string& ip );
+
   private:
+    ros::Time handleTime(struct msghdr* msg);
 
   private:
     int sockfd_;
